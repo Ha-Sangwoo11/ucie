@@ -37,23 +37,41 @@ import glob, os, re, sys
 cov_dir = sys.argv[1]
 line_re = re.compile(r"^\s*(\d+)\s+(\d+)/(\d+)\b")
 head_re = re.compile(r"^(\w+) Coverage for Module : (\S+)\s*$")
+# block-summary rows, e.g. "ALWAYS  276  402  368" / "INITIAL  1527  76  76"
+block_re = re.compile(r"^(ALWAYS|INITIAL|ROUTINE|FINAL)\s+(\d+)\s+\d+\s+\d+")
 
 # data[module][suite] = {lineno: (covered, total)}
 data = {}
 for path in glob.glob(os.path.join(cov_dir, "reports", "*", "modinfo.txt")):
     suite = os.path.basename(os.path.dirname(path))
     module = None
+    blocks = []   # [(startline, type)] of the current module's Line section
     with open(path, errors="replace") as f:
         for ln in f:
             m = head_re.match(ln)
             if m:
                 module = m.group(2) if m.group(1) == "Line" else None
+                blocks = []
                 continue
             if module is None:
+                continue
+            b = block_re.match(ln)
+            if b:
+                blocks.append((int(b.group(2)), b.group(1)))
                 continue
             m = line_re.match(ln)
             if m:
                 lineno, cov, tot = map(int, m.groups())
+                # skip lines belonging to `initial` blocks: they are simulation-only
+                # scaffolding (register init / if(reset)-at-time-zero) that never
+                # exists in silicon and can never execute under the svsim reset
+                # sequence — leaving them in permanently floors the metric.
+                owner = None
+                for start, typ in blocks:
+                    if start <= lineno and (owner is None or start > owner[0]):
+                        owner = (start, typ)
+                if owner and owner[1] == "INITIAL":
+                    continue
                 data.setdefault(module, {}).setdefault(suite, {})[lineno] = (cov, tot)
 
 def pct(cov, tot):
@@ -82,9 +100,11 @@ PYEOF
 {
   echo "Area verification map (generated $(date '+%Y-%m-%d %H:%M'))"
   echo "BEST   = best single-suite SCORE (all enabled metrics)"
-  echo "LINE-U = LINE coverage union across all suites ('*' = suites use different"
+  echo "LINE-U = LINE coverage union across all suites, EXCLUDING simulation-only"
+  echo "         initial-block lines (register-init scaffolding that cannot execute"
+  echo "         under the svsim reset sequence). '*' = suites use different"
   echo "         parameters, so this falls back to the best single suite; '--' = no"
-  echo "         line items in this module)"
+  echo "         line items in this module"
 
   for area_dir in "$SCALA_DIR"/src/uciedigital/*/ "$SCALA_DIR"/src/tilelink/ "$SCALA_DIR"/src/phy/; do
     [ -d "$area_dir" ] || continue

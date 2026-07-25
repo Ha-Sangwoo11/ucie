@@ -67,28 +67,56 @@ if [ ! -d build/chiselsim ]; then
 fi
 
 # --- Stage 1: accurate per-suite merges + reports ----------------------------
+# Merge unit: scenarios of a suite that elaborate the SAME design. Most suites
+# use one design for every scenario and merge as a single unit, but a suite can
+# drive several different DUTs (e.g. SidebandChannelRandomTest tests the
+# Protocol/D2D/LogPhy channels in one class); merging those together makes urg
+# silently drop every design but the first. Scenarios are therefore grouped by
+# a design fingerprint (the sorted list of generated .sv names), and each group
+# gets its own <Suite>__<scenario-prefix> entry.
 rm -rf "$COV_DIR/suites" "$COV_DIR/reports"
 mkdir -p "$COV_DIR/suites" "$COV_DIR/reports"
 TOTAL=0
 SUITES=()
 for sd in build/chiselsim/*/; do
   s=$(basename "$sd")
-  URG_ARGS=()
+  declare -A GROUP_VDBS=()
+  declare -A GROUP_LABEL=()
   n=0
   while IFS= read -r v; do
-    URG_ARGS+=(-dir "$SCALA_DIR/$v")
+    scen="${v%/workdir-vcs/simulation.vdb}"
+    # fingerprint by CONTENT, not just file names: scenarios with the same module
+    # set but different parametrization (e.g. 8 vs 16 lanes) are different designs,
+    # and merging them makes urg drop the extra instances' data (CMR-VCINF).
+    fp=$(find "$scen/primary-sources" -maxdepth 1 -name "*.sv" 2>/dev/null | sort \
+         | xargs cat 2>/dev/null | md5sum | cut -d' ' -f1)
+    GROUP_VDBS[$fp]="${GROUP_VDBS[$fp]:-}$SCALA_DIR/$v"$'\n'
+    # remember one scenario name per group for labeling
+    [ -z "${GROUP_LABEL[$fp]:-}" ] && GROUP_LABEL[$fp]=$(basename "$scen" | cut -c1-32)
     n=$((n + 1))
   done < <(find "$sd" -type d -name simulation.vdb 2>/dev/null | sort)
   [ "$n" -eq 0 ] && continue
   TOTAL=$((TOTAL + n))
-  SUITES+=("$s")
-  echo "[$s] merging $n vdbs"
-  # urg mishandles -dbname paths containing directories (it collapses them to
-  # the parent name), so run from suites/ with a plain db name instead.
-  ( cd "$COV_DIR/suites" \
-    && urg -full64 "${URG_ARGS[@]}" -dbname "$s" \
-        -report "$COV_DIR/reports/$s" -format both > /dev/null ) \
-    || echo "WARN: urg failed for suite $s"
+
+  ngroups=${#GROUP_VDBS[@]}
+  for fp in "${!GROUP_VDBS[@]}"; do
+    # short fingerprint suffix keeps labels unique when scenario-name prefixes collide
+    if [ "$ngroups" -eq 1 ]; then label="$s"; else label="${s}__${GROUP_LABEL[$fp]}-${fp:0:6}"; fi
+    URG_ARGS=()
+    g=0
+    while IFS= read -r vv; do
+      [ -n "$vv" ] && { URG_ARGS+=(-dir "$vv"); g=$((g + 1)); }
+    done <<< "${GROUP_VDBS[$fp]}"
+    SUITES+=("$label")
+    echo "[$label] merging $g vdbs"
+    # urg mishandles -dbname paths containing directories (it collapses them to
+    # the parent name), so run from suites/ with a plain db name instead.
+    ( cd "$COV_DIR/suites" \
+      && urg -full64 "${URG_ARGS[@]}" -dbname "$label" \
+          -report "$COV_DIR/reports/$label" -format both > /dev/null ) \
+      || echo "WARN: urg failed for $label"
+  done
+  unset GROUP_VDBS GROUP_LABEL
 done
 
 if [ "$TOTAL" -eq 0 ]; then
